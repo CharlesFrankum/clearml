@@ -431,6 +431,50 @@ class Dataset(object):
 
         return num_added
 
+    def add_files_from_list(
+        self,
+        paths,  # type: List[Union[str, Path, _Path]]
+        local_base_folder=None,  # type: Optional[str]
+        dataset_path=None,  # type: Optional[str]
+        verbose=False,  # type: bool
+        max_workers=None,  # type: Optional[int]
+    ):
+        # type: (...) -> ()
+        """
+        Add a list of files into the current dataset. calculate file hash,
+        and compare against parent, mark files to be uploaded
+
+        :param paths: Add a list of files to the dataset
+        :param local_base_folder: files will be located based on their relative path from local_base_folder
+        :param dataset_path: where in the dataset the folder/files should be located
+        :param verbose: If True, print to console added files
+        :param max_workers: The number of threads to add the files with. Defaults to the number of logical cores
+        """
+        max_workers = max_workers or psutil.cpu_count()
+        self._dirty = True
+        self._task.get_logger().report_text(
+            'Adding files to dataset: {}'.format(
+                dict(paths=[], local_base_folder=local_base_folder,
+                     dataset_path=dataset_path, verbose=verbose)),
+            print_console=False)
+
+        num_added, num_modified = self._add_files_from_list(
+            paths=paths,
+            local_base_folder=local_base_folder,
+            dataset_path=dataset_path,
+            verbose=verbose,
+            max_workers=max_workers,
+        )
+
+        # update the task script
+        self._add_script_call(
+            'add_files_from_list', paths=paths, local_base_folder=local_base_folder,
+            dataset_path=dataset_path)
+
+        self._serialize()
+
+        return num_added
+
     def add_external_files(
         self,
         source_url,  # type: Union[str, Sequence[str]]
@@ -1964,7 +2008,6 @@ class Dataset(object):
         :param paths: Add a list of files to the dataset
         :param local_base_folder: files will be located based on their relative path from local_base_folder
         :param dataset_path: where in the dataset the folder/files should be located
-        :param recursive: If True, match all wildcard files recursively
         :param verbose: If True, print to console added files
         :param max_workers: The number of threads to add the files with. Defaults to the number of logical cores
         """
