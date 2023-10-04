@@ -2094,7 +2094,6 @@ class Dataset(object):
         recursive=True,  # type: bool
         verbose=False,  # type: bool
         max_workers=None,  # type: Optional[int]
-        is_reference=False  # type: bool
     ):
         # type: (...) -> tuple[int, int]
         """
