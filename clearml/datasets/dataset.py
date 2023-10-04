@@ -1948,6 +1948,100 @@ class Dataset(object):
             for d in datasets
         ]
 
+    def _add_files_from_list(
+        self,
+        paths,  # type: List[Union[str, Path, _Path]]
+        local_base_folder=None,  # type: Optional[str]
+        dataset_path=None,  # type: Optional[str]
+        verbose=False,  # type: bool
+        max_workers=None,  # type: Optional[int]
+    ):
+        # type: (...) -> tuple[int, int]
+        """
+        Add a list of files into the current dataset. calculate file hash,
+        and compare against parent, mark files to be uploaded
+
+        :param paths: Add a list of files to the dataset
+        :param local_base_folder: files will be located based on their relative path from local_base_folder
+        :param dataset_path: where in the dataset the folder/files should be located
+        :param recursive: If True, match all wildcard files recursively
+        :param verbose: If True, print to console added files
+        :param max_workers: The number of threads to add the files with. Defaults to the number of logical cores
+        """
+        max_workers = max_workers or psutil.cpu_count()
+        if dataset_path:
+            dataset_path = dataset_path.lstrip("/")
+        local_base_folder = Path(local_base_folder or '/')
+
+        # prepare a list of files
+        files = [Path(path) for path in paths if Path(path).exists()]
+        file_entries = [f for f in files if f.is_file()]
+
+        file_entries = list(set(file_entries))
+        file_entries = [
+            FileEntry(
+                parent_dataset_id=self._id,
+                local_path=f.absolute().as_posix(),
+                relative_path=(Path(dataset_path or ".") / f.relative_to(local_base_folder)).as_posix(),
+            )
+            for f in file_entries
+        ]
+        self._task.get_logger().report_text('Generating SHA2 hash for {} files'.format(len(file_entries)))
+        pool = ThreadPool(max_workers)
+        try:
+            import tqdm  # noqa
+            for _ in tqdm.tqdm(pool.imap_unordered(self._calc_file_hash, file_entries), total=len(file_entries)):
+                pass
+        except ImportError:
+            pool.map(self._calc_file_hash, file_entries)
+        pool.close()
+        self._task.get_logger().report_text('Hash generation completed')
+
+        # Get modified files, files with the same filename but a different hash
+        filename_hash_dict = {fe.relative_path: fe.hash for fe in file_entries}
+        modified_count = len([k for k, v in self._dataset_file_entries.items()
+                              if k in filename_hash_dict and v.hash != filename_hash_dict[k]])
+
+        # merge back into the dataset
+        count = 0
+        for f in file_entries:
+            ds_cur_f = self._dataset_file_entries.get(f.relative_path)
+            if not ds_cur_f:
+                if (
+                    f.relative_path in self._dataset_link_entries
+                    and f.size == self._dataset_link_entries[f.relative_path].size
+                ):
+                    continue
+                if verbose:
+                    self._task.get_logger().report_text('Add {}'.format(f.relative_path))
+                self._dataset_file_entries[f.relative_path] = f
+                if f.relative_path not in self._dataset_link_entries:
+                    count += 1
+            elif ds_cur_f.hash != f.hash:
+                if verbose:
+                    self._task.get_logger().report_text('Modified {}'.format(f.relative_path))
+                self._dataset_file_entries[f.relative_path] = f
+                count += 1
+            elif f.parent_dataset_id == self._id and ds_cur_f.parent_dataset_id == self._id:
+                # check if we have the file in an already uploaded chunk
+                if ds_cur_f.local_path is None:
+                    # skipping, already uploaded.
+                    if verbose:
+                        self._task.get_logger().report_text('Skipping {}'.format(f.relative_path))
+                else:
+                    # if we never uploaded it, mark for upload
+                    if verbose:
+                        self._task.get_logger().report_text('Re-Added {}'.format(f.relative_path))
+                    self._dataset_file_entries[f.relative_path] = f
+                    count += 1
+            else:
+                if verbose:
+                    self._task.get_logger().report_text('Unchanged {}'.format(f.relative_path))
+
+        # We don't count the modified files as added files
+        self.update_changed_files(num_files_added=count - modified_count, num_files_modified=modified_count)
+        return count - modified_count, modified_count
+
     def _add_files(
         self,
         path,  # type: Union[str, Path, _Path]
@@ -1957,6 +2051,7 @@ class Dataset(object):
         recursive=True,  # type: bool
         verbose=False,  # type: bool
         max_workers=None,  # type: Optional[int]
+        is_reference=False  # type: bool
     ):
         # type: (...) -> tuple[int, int]
         """
