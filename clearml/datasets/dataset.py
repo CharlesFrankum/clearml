@@ -1992,6 +1992,62 @@ class Dataset(object):
             for d in datasets
         ]
 
+    def _merge_files(
+        self,
+        file_entries,  # type: list[FileEntry]
+        verbose=False,  # type: bool
+    ):
+        # type: (...) -> tuple[int, int]
+        """
+        Merge a list of files into the current dataset.
+        :param file_entries: List of files to be merged into the dataset
+        :param verbose: If True, print to console added files
+        """
+        # Get modified files, files with the same filename but a different hash
+        filename_hash_dict = {fe.relative_path: fe.hash for fe in file_entries}
+        modified_count = len([k for k, v in self._dataset_file_entries.items()
+                              if k in filename_hash_dict and v.hash != filename_hash_dict[k]])
+
+        # merge back into the dataset
+        count = 0
+        for f in file_entries:
+            ds_cur_f = self._dataset_file_entries.get(f.relative_path)
+            if not ds_cur_f:
+                if (
+                    f.relative_path in self._dataset_link_entries
+                    and f.size == self._dataset_link_entries[f.relative_path].size
+                ):
+                    continue
+                if verbose:
+                    self._task.get_logger().report_text('Add {}'.format(f.relative_path))
+                self._dataset_file_entries[f.relative_path] = f
+                if f.relative_path not in self._dataset_link_entries:
+                    count += 1
+            elif ds_cur_f.hash != f.hash:
+                if verbose:
+                    self._task.get_logger().report_text('Modified {}'.format(f.relative_path))
+                self._dataset_file_entries[f.relative_path] = f
+                count += 1
+            elif f.parent_dataset_id == self._id and ds_cur_f.parent_dataset_id == self._id:
+                # check if we have the file in an already uploaded chunk
+                if ds_cur_f.local_path is None:
+                    # skipping, already uploaded.
+                    if verbose:
+                        self._task.get_logger().report_text('Skipping {}'.format(f.relative_path))
+                else:
+                    # if we never uploaded it, mark for upload
+                    if verbose:
+                        self._task.get_logger().report_text('Re-Added {}'.format(f.relative_path))
+                    self._dataset_file_entries[f.relative_path] = f
+                    count += 1
+            else:
+                if verbose:
+                    self._task.get_logger().report_text('Unchanged {}'.format(f.relative_path))
+
+        # We don't count the modified files as added files
+        self.update_changed_files(num_files_added=count - modified_count, num_files_modified=modified_count)
+        return count - modified_count, modified_count
+
     def _add_files_from_list(
         self,
         paths,  # type: List[Union[str, Path, _Path]]
@@ -2040,50 +2096,7 @@ class Dataset(object):
         pool.close()
         self._task.get_logger().report_text('Hash generation completed')
 
-        # Get modified files, files with the same filename but a different hash
-        filename_hash_dict = {fe.relative_path: fe.hash for fe in file_entries}
-        modified_count = len([k for k, v in self._dataset_file_entries.items()
-                              if k in filename_hash_dict and v.hash != filename_hash_dict[k]])
-
-        # merge back into the dataset
-        count = 0
-        for f in file_entries:
-            ds_cur_f = self._dataset_file_entries.get(f.relative_path)
-            if not ds_cur_f:
-                if (
-                    f.relative_path in self._dataset_link_entries
-                    and f.size == self._dataset_link_entries[f.relative_path].size
-                ):
-                    continue
-                if verbose:
-                    self._task.get_logger().report_text('Add {}'.format(f.relative_path))
-                self._dataset_file_entries[f.relative_path] = f
-                if f.relative_path not in self._dataset_link_entries:
-                    count += 1
-            elif ds_cur_f.hash != f.hash:
-                if verbose:
-                    self._task.get_logger().report_text('Modified {}'.format(f.relative_path))
-                self._dataset_file_entries[f.relative_path] = f
-                count += 1
-            elif f.parent_dataset_id == self._id and ds_cur_f.parent_dataset_id == self._id:
-                # check if we have the file in an already uploaded chunk
-                if ds_cur_f.local_path is None:
-                    # skipping, already uploaded.
-                    if verbose:
-                        self._task.get_logger().report_text('Skipping {}'.format(f.relative_path))
-                else:
-                    # if we never uploaded it, mark for upload
-                    if verbose:
-                        self._task.get_logger().report_text('Re-Added {}'.format(f.relative_path))
-                    self._dataset_file_entries[f.relative_path] = f
-                    count += 1
-            else:
-                if verbose:
-                    self._task.get_logger().report_text('Unchanged {}'.format(f.relative_path))
-
-        # We don't count the modified files as added files
-        self.update_changed_files(num_files_added=count - modified_count, num_files_modified=modified_count)
-        return count - modified_count, modified_count
+        return self._merge_files(file_entries=file_entries, verbose=verbose)
 
     def _add_files(
         self,
@@ -2156,50 +2169,7 @@ class Dataset(object):
             pool.close()
             self._task.get_logger().report_text('Hash generation completed')
 
-        # Get modified files, files with the same filename but a different hash
-        filename_hash_dict = {fe.relative_path: fe.hash for fe in file_entries}
-        modified_count = len([k for k, v in self._dataset_file_entries.items()
-                              if k in filename_hash_dict and v.hash != filename_hash_dict[k]])
-
-        # merge back into the dataset
-        count = 0
-        for f in file_entries:
-            ds_cur_f = self._dataset_file_entries.get(f.relative_path)
-            if not ds_cur_f:
-                if (
-                    f.relative_path in self._dataset_link_entries
-                    and f.size == self._dataset_link_entries[f.relative_path].size
-                ):
-                    continue
-                if verbose:
-                    self._task.get_logger().report_text('Add {}'.format(f.relative_path))
-                self._dataset_file_entries[f.relative_path] = f
-                if f.relative_path not in self._dataset_link_entries:
-                    count += 1
-            elif ds_cur_f.hash != f.hash:
-                if verbose:
-                    self._task.get_logger().report_text('Modified {}'.format(f.relative_path))
-                self._dataset_file_entries[f.relative_path] = f
-                count += 1
-            elif f.parent_dataset_id == self._id and ds_cur_f.parent_dataset_id == self._id:
-                # check if we have the file in an already uploaded chunk
-                if ds_cur_f.local_path is None:
-                    # skipping, already uploaded.
-                    if verbose:
-                        self._task.get_logger().report_text('Skipping {}'.format(f.relative_path))
-                else:
-                    # if we never uploaded it, mark for upload
-                    if verbose:
-                        self._task.get_logger().report_text('Re-Added {}'.format(f.relative_path))
-                    self._dataset_file_entries[f.relative_path] = f
-                    count += 1
-            else:
-                if verbose:
-                    self._task.get_logger().report_text('Unchanged {}'.format(f.relative_path))
-
-        # We don't count the modified files as added files
-        self.update_changed_files(num_files_added=count - modified_count, num_files_modified=modified_count)
-        return count - modified_count, modified_count
+        return self._merge_files(file_entries=file_entries, verbose=verbose)
 
     def _update_dependency_graph(self):
         """
