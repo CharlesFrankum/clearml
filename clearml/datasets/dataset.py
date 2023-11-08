@@ -381,7 +381,7 @@ class Dataset(object):
 
     def add_files(
             self,
-            path,  # type: Union[str, Path, _Path]
+            path,  # type: Union[str, Path, _Path, Sequence[str], Sequence[Path], Sequence[_Path]]
             wildcard=None,  # type: Optional[Union[str, Sequence[str]]]
             local_base_folder=None,  # type: Optional[str]
             dataset_path=None,  # type: Optional[str]
@@ -394,7 +394,7 @@ class Dataset(object):
         Add a folder into the current dataset. calculate file hash,
         and compare against parent, mark files to be uploaded
 
-        :param path: Add a folder/file to the dataset
+        :param path: Add a folder/file or list of files to the dataset.
         :param wildcard: add only specific set of files.
             Wildcard matching, can be a single string or a list of wildcards.
         :param local_base_folder: files will be located based on their relative path from local_base_folder
@@ -426,50 +426,6 @@ class Dataset(object):
         self._add_script_call(
             'add_files', path=path, wildcard=wildcard, local_base_folder=local_base_folder,
             dataset_path=dataset_path, recursive=recursive)
-
-        self._serialize()
-
-        return num_added
-
-    def add_files_from_list(
-        self,
-        paths,  # type: List[Union[str, Path, _Path]]
-        local_base_folder=None,  # type: Optional[str]
-        dataset_path=None,  # type: Optional[str]
-        verbose=False,  # type: bool
-        max_workers=None,  # type: Optional[int]
-    ):
-        # type: (...) -> ()
-        """
-        Add a list of files into the current dataset. calculate file hash,
-        and compare against parent, mark files to be uploaded
-
-        :param paths: Add a list of files to the dataset
-        :param local_base_folder: files will be located based on their relative path from local_base_folder
-        :param dataset_path: where in the dataset the folder/files should be located
-        :param verbose: If True, print to console added files
-        :param max_workers: The number of threads to add the files with. Defaults to the number of logical cores
-        """
-        max_workers = max_workers or psutil.cpu_count()
-        self._dirty = True
-        self._task.get_logger().report_text(
-            'Adding files to dataset: {}'.format(
-                dict(paths=[], local_base_folder=local_base_folder,
-                     dataset_path=dataset_path, verbose=verbose)),
-            print_console=False)
-
-        num_added, num_modified = self._add_files_from_list(
-            paths=paths,
-            local_base_folder=local_base_folder,
-            dataset_path=dataset_path,
-            verbose=verbose,
-            max_workers=max_workers,
-        )
-
-        # update the task script
-        self._add_script_call(
-            'add_files_from_list', paths=paths, local_base_folder=local_base_folder,
-            dataset_path=dataset_path)
 
         self._serialize()
 
@@ -1992,17 +1948,88 @@ class Dataset(object):
             for d in datasets
         ]
 
-    def _merge_files(
+    def _add_files(
         self,
-        file_entries,  # type: list[FileEntry]
+        path,  # type: Union[str, Path, _Path, Sequence[str], Sequence[Path], Sequence[_Path]]
+        wildcard=None,  # type: Optional[Union[str, Sequence[str]]]
+        local_base_folder=None,  # type: Optional[str]
+        dataset_path=None,  # type: Optional[str]
+        recursive=True,  # type: bool
         verbose=False,  # type: bool
+        max_workers=None,  # type: Optional[int]
     ):
         # type: (...) -> tuple[int, int]
         """
-        Merge a list of files into the current dataset.
-        :param file_entries: List of files to be merged into the dataset
+        Add a folder into the current dataset. calculate file hash,
+        and compare against parent, mark files to be uploaded
+
+        :param path: Add a folder/file or list of files to the dataset.
+        :param wildcard: add only specific set of files.
+            Wildcard matching, can be a single string or a list of wildcards)
+        :param local_base_folder: files will be located based on their relative path from local_base_folder
+        :param dataset_path: where in the dataset the folder/files should be located
+        :param recursive: If True, match all wildcard files recursively
         :param verbose: If True, print to console added files
+        :param max_workers: The number of threads to add the files with. Defaults to the number of logical cores
         """
+        max_workers = max_workers or psutil.cpu_count()
+        if dataset_path:
+            dataset_path = dataset_path.lstrip("/")
+
+        if isinstance(wildcard, str):
+            wildcard = [wildcard]
+        wildcard = wildcard or ["*"]
+
+        if isinstance(path, str) or isinstance(path, Path) or isinstance(path, _Path):
+            path = Path(path)
+            local_base_folder = Path(local_base_folder or path)
+            # single file, no need for threading
+            if path.is_file():
+                if not local_base_folder.is_dir():
+                    local_base_folder = local_base_folder.parent
+                file_entry = self._calc_file_hash(
+                    FileEntry(local_path=path.absolute().as_posix(),
+                              relative_path=(Path(dataset_path or '.') / path.relative_to(local_base_folder)).as_posix(),
+                              parent_dataset_id=self._id))
+                file_entries = [file_entry]
+            else:
+                # if not a folder raise exception
+                if not path.is_dir():
+                    raise ValueError("Could not find file/folder \'{}\'", path.as_posix())
+
+                # prepare a list of files
+                file_entries = []
+                for w in wildcard:
+                    files = list(path.rglob(w)) if recursive else list(path.glob(w))
+                    file_entries.extend([f for f in files if f.is_file()])
+                file_entries = list(set(file_entries))
+                file_entries = [
+                    FileEntry(
+                        parent_dataset_id=self._id,
+                        local_path=f.absolute().as_posix(),
+                        relative_path=(Path(dataset_path or ".") / f.relative_to(local_base_folder)).as_posix(),
+                    )
+                    for f in file_entries
+                ]
+        else:
+            local_base_folder = Path(local_base_folder or '/')
+            # prepare a list of files
+            files = [Path(p) for p in path if Path(p).exists()]
+            file_entries = [f for f in files if f.is_file()]
+
+        # Use threading if more than 1 file
+        if len(file_entries) > 1:
+            self._task.get_logger().report_text('Generating SHA2 hash for {} files'.format(len(file_entries)))
+            pool = ThreadPool(max_workers)
+            try:
+                import tqdm  # noqa
+                for _ in tqdm.tqdm(pool.imap_unordered(self._calc_file_hash, file_entries), total=len(file_entries)):
+                    pass
+            except ImportError:
+                pool.map(self._calc_file_hash, file_entries)
+            pool.close()
+            self._task.get_logger().report_text('Hash generation completed')
+
         # Get modified files, files with the same filename but a different hash
         filename_hash_dict = {fe.relative_path: fe.hash for fe in file_entries}
         modified_count = len([k for k, v in self._dataset_file_entries.items()
@@ -2047,129 +2074,6 @@ class Dataset(object):
         # We don't count the modified files as added files
         self.update_changed_files(num_files_added=count - modified_count, num_files_modified=modified_count)
         return count - modified_count, modified_count
-
-    def _add_files_from_list(
-        self,
-        paths,  # type: List[Union[str, Path, _Path]]
-        local_base_folder=None,  # type: Optional[str]
-        dataset_path=None,  # type: Optional[str]
-        verbose=False,  # type: bool
-        max_workers=None,  # type: Optional[int]
-    ):
-        # type: (...) -> tuple[int, int]
-        """
-        Add a list of files into the current dataset. calculate file hash,
-        and compare against parent, mark files to be uploaded
-
-        :param paths: Add a list of files to the dataset
-        :param local_base_folder: files will be located based on their relative path from local_base_folder
-        :param dataset_path: where in the dataset the folder/files should be located
-        :param verbose: If True, print to console added files
-        :param max_workers: The number of threads to add the files with. Defaults to the number of logical cores
-        """
-        max_workers = max_workers or psutil.cpu_count()
-        if dataset_path:
-            dataset_path = dataset_path.lstrip("/")
-        local_base_folder = Path(local_base_folder or '/')
-
-        # prepare a list of files
-        files = [Path(path) for path in paths if Path(path).exists()]
-        file_entries = [f for f in files if f.is_file()]
-
-        file_entries = list(set(file_entries))
-        file_entries = [
-            FileEntry(
-                parent_dataset_id=self._id,
-                local_path=f.absolute().as_posix(),
-                relative_path=(Path(dataset_path or ".") / f.relative_to(local_base_folder)).as_posix(),
-            )
-            for f in file_entries
-        ]
-        self._task.get_logger().report_text('Generating SHA2 hash for {} files'.format(len(file_entries)))
-        pool = ThreadPool(max_workers)
-        try:
-            import tqdm  # noqa
-            for _ in tqdm.tqdm(pool.imap_unordered(self._calc_file_hash, file_entries), total=len(file_entries)):
-                pass
-        except ImportError:
-            pool.map(self._calc_file_hash, file_entries)
-        pool.close()
-        self._task.get_logger().report_text('Hash generation completed')
-
-        return self._merge_files(file_entries=file_entries, verbose=verbose)
-
-    def _add_files(
-        self,
-        path,  # type: Union[str, Path, _Path]
-        wildcard=None,  # type: Optional[Union[str, Sequence[str]]]
-        local_base_folder=None,  # type: Optional[str]
-        dataset_path=None,  # type: Optional[str]
-        recursive=True,  # type: bool
-        verbose=False,  # type: bool
-        max_workers=None,  # type: Optional[int]
-    ):
-        # type: (...) -> tuple[int, int]
-        """
-        Add a folder into the current dataset. calculate file hash,
-        and compare against parent, mark files to be uploaded
-
-        :param path: Add a folder/file to the dataset
-        :param wildcard: add only specific set of files.
-            Wildcard matching, can be a single string or a list of wildcards)
-        :param local_base_folder: files will be located based on their relative path from local_base_folder
-        :param dataset_path: where in the dataset the folder/files should be located
-        :param recursive: If True, match all wildcard files recursively
-        :param verbose: If True, print to console added files
-        :param max_workers: The number of threads to add the files with. Defaults to the number of logical cores
-        """
-        max_workers = max_workers or psutil.cpu_count()
-        if dataset_path:
-            dataset_path = dataset_path.lstrip("/")
-        path = Path(path)
-        local_base_folder = Path(local_base_folder or path)
-        wildcard = wildcard or ["*"]
-        if isinstance(wildcard, str):
-            wildcard = [wildcard]
-        # single file, no need for threading
-        if path.is_file():
-            if not local_base_folder.is_dir():
-                local_base_folder = local_base_folder.parent
-            file_entry = self._calc_file_hash(
-                FileEntry(local_path=path.absolute().as_posix(),
-                          relative_path=(Path(dataset_path or '.') / path.relative_to(local_base_folder)).as_posix(),
-                          parent_dataset_id=self._id))
-            file_entries = [file_entry]
-        else:
-            # if not a folder raise exception
-            if not path.is_dir():
-                raise ValueError("Could not find file/folder \'{}\'", path.as_posix())
-
-            # prepare a list of files
-            file_entries = []
-            for w in wildcard:
-                files = list(path.rglob(w)) if recursive else list(path.glob(w))
-                file_entries.extend([f for f in files if f.is_file()])
-            file_entries = list(set(file_entries))
-            file_entries = [
-                FileEntry(
-                    parent_dataset_id=self._id,
-                    local_path=f.absolute().as_posix(),
-                    relative_path=(Path(dataset_path or ".") / f.relative_to(local_base_folder)).as_posix(),
-                )
-                for f in file_entries
-            ]
-            self._task.get_logger().report_text('Generating SHA2 hash for {} files'.format(len(file_entries)))
-            pool = ThreadPool(max_workers)
-            try:
-                import tqdm  # noqa
-                for _ in tqdm.tqdm(pool.imap_unordered(self._calc_file_hash, file_entries), total=len(file_entries)):
-                    pass
-            except ImportError:
-                pool.map(self._calc_file_hash, file_entries)
-            pool.close()
-            self._task.get_logger().report_text('Hash generation completed')
-
-        return self._merge_files(file_entries=file_entries, verbose=verbose)
 
     def _update_dependency_graph(self):
         """
