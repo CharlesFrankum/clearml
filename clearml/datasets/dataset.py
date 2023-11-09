@@ -1955,7 +1955,18 @@ class Dataset(object):
         local_base_folder=None,  # type: Optional[str]
         dataset_path=None,  # type: Optional[str]
         recursive=True,  # type: bool
-    ) -> list[FileEntry]:
+    ):
+        # type: (...) -> list[FileEntry]
+        """
+        Calculates file hashes for a folder/file.
+
+        :param path: Add a folder/file or list of files to the dataset.
+        :param wildcard: add only specific set of files.
+            Wildcard matching, can be a single string or a list of wildcards)
+        :param local_base_folder: files will be located based on their relative path from local_base_folder
+        :param dataset_path: where in the dataset the folder/files should be located
+        :param recursive: If True, match all wildcard files recursively
+        """
         path = Path(path)
         local_base_folder = Path(local_base_folder or path)
         if path.is_file():
