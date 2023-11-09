@@ -1948,6 +1948,56 @@ class Dataset(object):
             for d in datasets
         ]
 
+    def _resolve_file_entries(
+        self,
+        path,  # type: Union[str, Path, _Path]
+        wildcard=None,  # type: Optional[Union[str, Sequence[str]]]
+        local_base_folder=None,  # type: Optional[str]
+        dataset_path=None,  # type: Optional[str]
+        recursive=True,  # type: bool
+    ):
+        # type: (...) -> list[FileEntry]
+        """
+        Calculates file hashes for a folder/file.
+
+        :param path: Add a folder/file or list of files to the dataset.
+        :param wildcard: add only specific set of files.
+            Wildcard matching, can be a single string or a list of wildcards)
+        :param local_base_folder: files will be located based on their relative path from local_base_folder
+        :param dataset_path: where in the dataset the folder/files should be located
+        :param recursive: If True, match all wildcard files recursively
+        """
+        path = Path(path)
+        local_base_folder = Path(local_base_folder or path)
+        if path.is_file():
+            if not local_base_folder.is_dir():
+                local_base_folder = local_base_folder.parent
+            file_entry = self._calc_file_hash(
+                FileEntry(local_path=path.absolute().as_posix(),
+                          relative_path=(Path(dataset_path or '.') / path.relative_to(local_base_folder)).as_posix(),
+                          parent_dataset_id=self._id))
+            file_entries = [file_entry]
+        else:
+            # if not a folder raise exception
+            if not path.is_dir():
+                raise ValueError("Could not find file/folder \'{}\'", path.as_posix())
+
+            # prepare a list of files
+            file_entries = []
+            for w in wildcard:
+                files = list(path.rglob(w)) if recursive else list(path.glob(w))
+                file_entries.extend([f for f in files if f.is_file()])
+            file_entries = list(set(file_entries))
+            file_entries = [
+                FileEntry(
+                    parent_dataset_id=self._id,
+                    local_path=f.absolute().as_posix(),
+                    relative_path=(Path(dataset_path or ".") / f.relative_to(local_base_folder)).as_posix(),
+                )
+                for f in file_entries
+            ]
+        return file_entries
+
     def _add_files(
         self,
         path,  # type: Union[str, Path, _Path, Sequence[str], Sequence[Path], Sequence[_Path]]
@@ -1975,50 +2025,24 @@ class Dataset(object):
         max_workers = max_workers or psutil.cpu_count()
         if dataset_path:
             dataset_path = dataset_path.lstrip("/")
-
+        wildcard = wildcard or ["*"]
         if isinstance(wildcard, str):
             wildcard = [wildcard]
-        wildcard = wildcard or ["*"]
-
-        if isinstance(path, str) or isinstance(path, Path) or isinstance(path, _Path):
-            path = Path(path)
-            local_base_folder = Path(local_base_folder or path)
-            # single file, no need for threading
-            if path.is_file():
-                if not local_base_folder.is_dir():
-                    local_base_folder = local_base_folder.parent
-                file_entry = self._calc_file_hash(
-                    FileEntry(local_path=path.absolute().as_posix(),
-                              relative_path=(Path(dataset_path or '.') / path.relative_to(local_base_folder)).as_posix(),
-                              parent_dataset_id=self._id))
-                file_entries = [file_entry]
-            else:
-                # if not a folder raise exception
-                if not path.is_dir():
-                    raise ValueError("Could not find file/folder \'{}\'", path.as_posix())
-
-                # prepare a list of files
-                file_entries = []
-                for w in wildcard:
-                    files = list(path.rglob(w)) if recursive else list(path.glob(w))
-                    file_entries.extend([f for f in files if f.is_file()])
-                file_entries = list(set(file_entries))
-                file_entries = [
-                    FileEntry(
-                        parent_dataset_id=self._id,
-                        local_path=f.absolute().as_posix(),
-                        relative_path=(Path(dataset_path or ".") / f.relative_to(local_base_folder)).as_posix(),
-                    )
-                    for f in file_entries
-                ]
-        else:
-            local_base_folder = Path(local_base_folder or '/')
-            # prepare a list of files
-            files = [Path(p) for p in path if Path(p).exists()]
-            file_entries = [f for f in files if f.is_file()]
-
+        if isinstance(path, (str, Path, _Path)):
+            path = [path]  # ensure list
+        file_entries = []
+        for p in path:
+            file_entries.extend(self._resolve_file_entries(
+                path=p,
+                wildcard=wildcard,
+                local_base_folder=local_base_folder,
+                dataset_path=dataset_path,
+                recursive=recursive,
+            ))
         # Use threading if more than 1 file
-        if len(file_entries) > 1:
+        if len(file_entries) == 1:
+            file_entries = self._calc_file_hash(file_entries[0])
+        else:
             self._task.get_logger().report_text('Generating SHA2 hash for {} files'.format(len(file_entries)))
             pool = ThreadPool(max_workers)
             try:
