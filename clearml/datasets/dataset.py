@@ -2021,7 +2021,13 @@ class Dataset(object):
             path = [path]  # ensure list
         file_entries = []
         for p in path:
-            file_entries.extend(self._resolve_file_entries(p, wildcard, local_base_folder, dataset_path, recursive))
+            file_entries.extend(self._resolve_file_entries(
+                path=p,
+                wildcard=wildcard,
+                local_base_folder=local_base_folder,
+                dataset_path=dataset_path,
+                recursive=recursive,
+            ))
         # Use threading if more than 1 file
         if len(file_entries) == 1:
             file_entries = self._calc_file_hash(file_entries[0])
