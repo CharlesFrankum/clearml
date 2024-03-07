@@ -12,6 +12,7 @@ import jwt
 import requests
 import six
 from requests.auth import HTTPBasicAuth
+from requests.exceptions import ChunkedEncodingError, ContentDecodingError, StreamConsumedError
 from six.moves.urllib.parse import urlparse, urlunparse
 from typing import List, Optional
 
@@ -31,11 +32,13 @@ from .defs import (
     ENV_API_EXTRA_RETRY_CODES,
     ENV_API_DEFAULT_REQ_METHOD,
     ENV_FORCE_MAX_API_VERSION,
+    ENV_IGNORE_MISSING_CONFIG,
     MissingConfigError
 )
 from .request import Request, BatchRequest  # noqa: F401
 from .token_manager import TokenManager
 from ..utils import get_http_session_with_retry, urllib_log_warning_setup
+from ...backend_config import ConfigurationError
 from ...backend_config.defs import get_config_file
 from ...debugging import get_logger
 from ...debugging.log import resolve_logging_level
@@ -290,7 +293,7 @@ class Session(TokenManager):
         return list(retry_codes)
 
     def _read_vaults(self):
-        # () -> Optional[dict]
+        # () -> Optional[List[dict]]
         if not self.check_min_api_version("2.15") or self.feature_set == "basic":
             return
 
@@ -415,6 +418,13 @@ class Session(TokenManager):
                 # we should retry
                 if retry_counter >= self._ssl_error_count_verbosity:
                     (self._logger or get_logger()).warning("SSLError Retrying {}".format(ex))
+                sleep(0.1)
+                continue
+            except (ChunkedEncodingError, ContentDecodingError, StreamConsumedError) as ex:
+                retry_counter += 1
+                # we should retry
+                if retry_counter >= self._ssl_error_count_verbosity:
+                    (self._logger or get_logger()).warning("Network decoding error Retrying {}".format(ex))
                 sleep(0.1)
                 continue
 
@@ -736,7 +746,7 @@ class Session(TokenManager):
         return urlunparse(parsed)
 
     @classmethod
-    def check_min_api_version(cls, min_api_version):
+    def check_min_api_version(cls, min_api_version, raise_error=False):
         """
         Return True if Session.api_version is greater or equal >= to min_api_version
         """
@@ -764,18 +774,24 @@ class Session(TokenManager):
                 # noinspection PyBroadException
                 try:
                     cls()
+                except (MissingConfigError, ConfigurationError):
+                    if raise_error and not ENV_IGNORE_MISSING_CONFIG.get():
+                        raise
+                except LoginError:
+                    if raise_error:
+                        raise
                 except Exception:
                     pass
 
         return cls._version_tuple(cls.api_version) >= cls._version_tuple(str(min_api_version))
 
     @classmethod
-    def check_min_api_server_version(cls, min_api_version):
+    def check_min_api_server_version(cls, min_api_version, raise_error=False):
         """
         Return True if Session.max_api_version is greater or equal >= to min_api_version
         Notice this is the api version server reported, not the current SDK max supported api version
         """
-        if cls.check_min_api_version(min_api_version):
+        if cls.check_min_api_version(min_api_version, raise_error=raise_error):
             return True
 
         return cls._version_tuple(cls.max_api_version) >= cls._version_tuple(str(min_api_version))

@@ -11,8 +11,7 @@ ENV_AUTH_TOKEN = EnvEntry("CLEARML_AUTH_TOKEN")
 ENV_VERBOSE = EnvEntry(
     "CLEARML_API_VERBOSE", "TRAINS_API_VERBOSE", converter=safe_text_to_bool, type=bool, default=False
 )
-ENV_HOST_VERIFY_CERT = EnvEntry("CLEARML_API_HOST_VERIFY_CERT", "TRAINS_API_HOST_VERIFY_CERT",
-                                type=bool, default=True)
+ENV_HOST_VERIFY_CERT = EnvEntry("CLEARML_API_HOST_VERIFY_CERT", "TRAINS_API_HOST_VERIFY_CERT", default=True)
 ENV_OFFLINE_MODE = EnvEntry("CLEARML_OFFLINE_MODE", "TRAINS_OFFLINE_MODE", type=bool, converter=safe_text_to_bool)
 ENV_CLEARML_NO_DEFAULT_SERVER = EnvEntry(
     "CLEARML_NO_DEFAULT_SERVER", "TRAINS_NO_DEFAULT_SERVER", converter=safe_text_to_bool, type=bool, default=True
@@ -39,7 +38,6 @@ NOTE: this changes behavior and might cause the experiment to wait
 for a very long time for a non-responding or mis-configured server
 """
 ENV_API_EXTRA_RETRY_CODES = EnvEntry("CLEARML_API_EXTRA_RETRY_CODES")
-
 
 ENV_FORCE_MAX_API_VERSION = EnvEntry("CLEARML_FORCE_MAX_API_VERSION", type=str)
 

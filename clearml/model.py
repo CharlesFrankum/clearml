@@ -1,9 +1,8 @@
 import abc
 import os
-import tarfile
 import zipfile
 import shutil
-from tempfile import mkdtemp, mkstemp
+from tempfile import mkstemp
 
 import six
 import math
@@ -343,11 +342,22 @@ class BaseModel(object):
     @property
     def published(self):
         # type: () -> bool
+        """
+        Get the published state of this model.
+
+        :return:
+
+        """
         return self._get_base_model().locked
 
     @property
     def framework(self):
         # type: () -> str
+        """
+        The ML framework of the model (for example: PyTorch, TensorFlow, XGBoost, etc.).
+
+        :return: The model's framework
+        """
         return self._get_model_data().framework
 
     def __init__(self, task=None):
@@ -362,8 +372,8 @@ class BaseModel(object):
         self._task_connect_name = None
         self._set_task(task)
 
-    def get_weights(self, raise_on_error=False, force_download=False):
-        # type: (bool, bool) -> str
+    def get_weights(self, raise_on_error=False, force_download=False, extract_archive=False):
+        # type: (bool, bool, bool) -> str
         """
         Download the base model and return the locally stored filename.
 
@@ -373,17 +383,19 @@ class BaseModel(object):
         :param bool force_download: If True, the base model will be downloaded,
             even if the base model is already cached.
 
+        :param bool extract_archive: If True, the downloaded weights file will be extracted if possible
+
         :return: The locally stored file.
         """
         # download model (synchronously) and return local file
         return self._get_base_model().download_model_weights(
-            raise_on_error=raise_on_error, force_download=force_download
+            raise_on_error=raise_on_error, force_download=force_download, extract_archive=extract_archive
         )
 
     def get_weights_package(
-        self, return_path=False, raise_on_error=False, force_download=False
+        self, return_path=False, raise_on_error=False, force_download=False, extract_archive=True
     ):
-        # type: (bool, bool, bool) -> Optional[Union[str, List[Path]]]
+        # type: (bool, bool, bool, bool) -> Optional[Union[str, List[Path]]]
         """
         Download the base model package into a temporary directory (extract the files), or return a list of the
         locally stored filenames.
@@ -399,6 +411,8 @@ class BaseModel(object):
         :param bool force_download: If True, the base artifact will be downloaded,
             even if the artifact is already cached.
 
+        :param bool extract_archive: If True, the downloaded weights file will be extracted if possible
+
         :return: The model weights, or a list of the locally stored filenames.
             if raise_on_error=False, returns None on error.
         """
@@ -407,40 +421,21 @@ class BaseModel(object):
             raise ValueError("Model is not packaged")
 
         # download packaged model
-        packed_file = self.get_weights(
-            raise_on_error=raise_on_error, force_download=force_download
+        model_path = self.get_weights(
+            raise_on_error=raise_on_error, force_download=force_download, extract_archive=extract_archive
         )
 
-        if not packed_file:
+        if not model_path:
             if raise_on_error:
                 raise ValueError(
                     "Model package '{}' could not be downloaded".format(self.url)
                 )
             return None
 
-        # unpack
-        target_folder = mkdtemp(prefix="model_package_")
-        if not target_folder:
-            raise ValueError(
-                "cannot create temporary directory for packed weight files"
-            )
-
-        for func in (zipfile.ZipFile, tarfile.open):
-            try:
-                obj = func(packed_file)
-                obj.extractall(path=target_folder)
-                break
-            except (zipfile.BadZipfile, tarfile.ReadError):
-                pass
-        else:
-            raise ValueError(
-                "cannot extract files from packaged model at %s", packed_file
-            )
-
         if return_path:
-            return target_folder
+            return model_path
 
-        target_files = list(Path(target_folder).glob("*"))
+        target_files = list(Path(model_path).glob("*"))
         return target_files
 
     def report_scalar(self, title, series, value, iteration):
@@ -1374,17 +1369,18 @@ class Model(BaseModel):
         self._base_model = None
 
     def get_local_copy(
-        self, extract_archive=True, raise_on_error=False, force_download=False
+        self, extract_archive=None, raise_on_error=False, force_download=False
     ):
-        # type: (bool, bool, bool) -> str
+        # type: (Optional[bool], bool, bool) -> str
         """
         Retrieve a valid link to the model file(s).
         If the model URL is a file system link, it will be returned directly.
         If the model URL points to a remote location (http/s3/gs etc.),
         it will download the file(s) and return the temporary location of the downloaded model.
 
-        :param bool extract_archive: If True, and the model is of type 'packaged' (e.g. TensorFlow compressed folder)
-            The returned path will be a temporary folder containing the archive content
+        :param bool extract_archive: If True, the local copy will be extracted if possible. If False,
+            the local copy will not be extracted. If None (default), the downloaded file will be extracted
+            if the model is a package.
         :param bool raise_on_error: If True, and the artifact could not be downloaded,
             raise ValueError, otherwise return None on failure and output log warning.
         :param bool force_download: If True, the artifact will be downloaded,
@@ -1392,14 +1388,17 @@ class Model(BaseModel):
 
         :return: A local path to the model (or a downloaded copy of it).
         """
-        if extract_archive and self._is_package():
+        if self._is_package():
             return self.get_weights_package(
                 return_path=True,
                 raise_on_error=raise_on_error,
                 force_download=force_download,
+                extract_archive=True if extract_archive is None else extract_archive
             )
         return self.get_weights(
-            raise_on_error=raise_on_error, force_download=force_download
+            raise_on_error=raise_on_error,
+            force_download=force_download,
+            extract_archive=False if extract_archive is None else extract_archive
         )
 
     def _get_base_model(self):
@@ -1438,12 +1437,31 @@ class Model(BaseModel):
 
         :param project_name: Optional, filter based project name string, if not given query models from all projects
         :param model_name: Optional Model name as shown in the model artifactory
-        :param tags: Filter based on the requested list of tags (strings)
-            To exclude a tag add "-" prefix to the tag. Example: ['production', 'verified', '-qa']
-            To include All tags (instead of the default Any behaviour) use "__$all" as the first string, example:
-            ["__$all", "best", "model", "ever"]
-            To combine All tags and exclude a list of tags use "__$not" before the excluded tags, example:
-            ["__$all", "best", "model", "ever", "__$not", "internal", "__$not", "test"]
+        :param tags: Filter based on the requested list of tags (strings).
+            To exclude a tag add "-" prefix to the tag. Example: ``["production", "verified", "-qa"]``.
+            The default behaviour is to join all tags with a logical "OR" operator.
+            To join all tags with a logical "AND" operator instead, use "__$all" as the first string, for example:
+
+            .. code-block:: py
+
+                ["__$all", "best", "model", "ever"]
+
+            To join all tags with AND, but exclude a tag use "__$not" before the excluded tag, for example:
+
+            .. code-block:: py
+
+                ["__$all", "best", "model", "ever", "__$not", "internal", "__$not", "test"]
+
+            The "OR" and "AND" operators apply to all tags that follow them until another operator is specified.
+            The NOT operator applies only to the immediately following tag.
+            For example:
+
+            .. code-block:: py
+
+                ["__$all", "a", "b", "c", "__$or", "d", "__$not", "e", "__$and", "__$or" "f", "g"]
+
+            This example means ("a" AND "b" AND "c" AND ("d" OR NOT "e") AND ("f" OR "g")).
+            See https://clear.ml/docs/latest/docs/clearml_sdk/model_sdk#tag-filters for details.
         :param only_published: If True, only return published models.
         :param include_archived: If True, return archived models.
         :param max_results: Optional return the last X models,
@@ -1607,6 +1625,7 @@ class InputModel(Model):
 
     # noinspection PyProtectedMember
     _EMPTY_MODEL_ID = _Model._EMPTY_MODEL_ID
+    _WARNING_CONNECTED_NAMES = {}
 
     @classmethod
     def import_model(
@@ -1924,8 +1943,8 @@ class InputModel(Model):
         # type: () -> str
         return self._base_model_id
 
-    def connect(self, task, name=None):
-        # type: (Task, Optional[str]) -> None
+    def connect(self, task, name=None, ignore_remote_overrides=False):
+        # type: (Task, Optional[str], bool) -> None
         """
         Connect the current model to a Task object, if the model is preexisting. Preexisting models include:
 
@@ -1935,22 +1954,31 @@ class InputModel(Model):
         - Models whose origin is not ClearML that are used to create an InputModel object. For example,
           models created using TensorFlow models.
 
-        When the experiment is executed remotely in a worker, the input model already specified in the experiment is
-        used.
+        When the experiment is executed remotely in a worker, the input model specified in the experiment UI/backend
+        is used, unless `ignore_remote_overrides` is set to True.
 
         .. note::
            The **ClearML Web-App** allows you to switch one input model for another and then enqueue the experiment
            to execute in a worker.
 
         :param object task: A Task object.
+        :param ignore_remote_overrides: If True, changing the model in the UI/backend will have no
+            effect when running remotely.
+            Default is False, meaning that any changes made in the UI/backend will be applied in remote execution.
         :param str name: The model name to be stored on the Task
-            (default the filename, of the model weights, without the file extension)
+            (default to filename of the model weights, without the file extension, or to `Input Model`
+            if that is not found)
         """
         self._set_task(task)
+        name = name or InputModel._get_connect_name(self)
+        InputModel._warn_on_same_name_connect(name)
+        ignore_remote_overrides = task._handle_ignore_remote_overrides(
+            name + "/_ignore_remote_overrides_input_model_", ignore_remote_overrides
+        )
 
         model_id = None
         # noinspection PyProtectedMember
-        if running_remotely() and (task.is_main_task() or task._is_remote_main_task()):
+        if running_remotely() and (task.is_main_task() or task._is_remote_main_task()) and not ignore_remote_overrides:
             input_models = task.input_models_id
             # noinspection PyBroadException
             try:
@@ -1977,6 +2005,28 @@ class InputModel(Model):
                 task._set_model_config(config_text=model.model_design)
             if not self._task.get_labels_enumeration() and model.data.labels:
                 task.set_model_label_enumeration(model.data.labels)
+
+    @classmethod
+    def _warn_on_same_name_connect(cls, name):
+        if name not in cls._WARNING_CONNECTED_NAMES:
+            cls._WARNING_CONNECTED_NAMES[name] = False
+            return
+        if cls._WARNING_CONNECTED_NAMES[name]:
+            return
+        get_logger().warning("Connecting multiple input models with the same name: `{}`. This might result in the wrong model being used when executing remotely".format(name))
+        cls._WARNING_CONNECTED_NAMES[name] = True
+
+    @staticmethod
+    def _get_connect_name(model):
+        default_name = "Input Model"
+        if model is None:
+            return default_name
+        # noinspection PyBroadException
+        try:
+            model_uri = getattr(model, "url", getattr(model, "uri", None))
+            return Path(model_uri).stem
+        except Exception:
+            return default_name
 
 
 class OutputModel(BaseModel):
@@ -2097,6 +2147,11 @@ class OutputModel(BaseModel):
     @property
     def upload_storage_uri(self):
         # type: () -> str
+        """
+        The URI of the storage destination for uploaded model weight files.
+
+        :return: The URI string
+        """
         return self._get_base_model().upload_storage_uri
 
     def __init__(
@@ -2213,7 +2268,7 @@ class OutputModel(BaseModel):
             pass
         self.connect(task, name=name)
 
-    def connect(self, task, name=None):
+    def connect(self, task, name=None, **kwargs):
         # type: (Task, Optional[str]) -> None
         """
         Connect the current model to a Task object, if the model is a preexisting model. Preexisting models include:
@@ -2315,6 +2370,7 @@ class OutputModel(BaseModel):
         iteration=None,  # type: Optional[int]
         update_comment=True,  # type: bool
         is_package=False,  # type: bool
+        async_enable=True,  # type: bool
     ):
         # type: (...) -> str
         """
@@ -2342,6 +2398,8 @@ class OutputModel(BaseModel):
             - ``True`` - Update model comment (Default)
             - ``False`` - Do not update
         :param bool is_package: Mark the weights file as compressed package, usually a zip file.
+        :param bool async_enable: Whether to upload model in background or to block.
+            Will raise an error in the main thread if the weights failed to be uploaded or not.
 
         :return: The uploaded URI.
         """
@@ -2389,6 +2447,7 @@ class OutputModel(BaseModel):
                     target_filename=target_filename or Path(weights_filename).name,
                     auto_delete_file=auto_delete_file,
                     iteration=iteration,
+                    async_enable=async_enable
                 )
 
             # make sure we delete the previous file, if it exists
@@ -2470,7 +2529,7 @@ class OutputModel(BaseModel):
             output_uri = model.update_and_upload(
                 model_file=weights_filename,
                 task_id=self._task.id,
-                async_enable=True,
+                async_enable=async_enable,
                 target_filename=target_filename,
                 framework=self.framework or framework,
                 comment=comment,
@@ -2503,6 +2562,7 @@ class OutputModel(BaseModel):
         target_filename=None,  # type: Optional[str]
         auto_delete_file=True,  # type: bool
         iteration=None,  # type: Optional[int]
+        async_enable=True,  # type: bool
     ):
         # type: (...) -> str
         """
@@ -2527,6 +2587,8 @@ class OutputModel(BaseModel):
             - ``False`` - Do not delete
 
         :param int iteration: The iteration number.
+        :param bool async_enable: Whether to upload model in background or to block.
+            Will raise an error in the main thread if the weights failed to be uploaded or not.
 
         :return: The uploaded URI for the weights package.
         """
@@ -2594,6 +2656,7 @@ class OutputModel(BaseModel):
             target_filename=target_filename or "model_package.zip",
             iteration=iteration,
             update_comment=False,
+            async_enable=async_enable
         )
         # set the model tag (by now we should have a model object) so we know we have packaged file
         self._set_package_tag()

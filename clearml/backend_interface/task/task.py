@@ -1088,12 +1088,13 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
             if not model.ready:
                 # raise ValueError('Model %s is not published (not ready)' % model_id)
                 self.log.debug('Model %s [%s] is not published yet (not ready)' % (model_id, model.uri))
-            name = name or Path(model.uri).stem
         else:
             # clear the input model
             model = None
             model_id = ''
-            name = name or 'Input Model'
+        from ...model import InputModel
+        # noinspection PyProtectedMember
+        name = name or InputModel._get_connect_name(model)
 
         with self._edit_lock:
             self.reload()
@@ -1344,12 +1345,14 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         params = self.get_parameters(cast=cast)
         return params.get(name, default)
 
-    def delete_parameter(self, name):
-        # type: (str) -> bool
+    def delete_parameter(self, name, force=False):
+        # type: (str, bool) -> bool
         """
         Delete a parameter by its full name Section/name.
 
         :param name: Parameter name in full, i.e. Section/name. For example, 'Args/batch_size'
+        :param force: If set to True then both new and running task hyper params can be deleted.
+            Otherwise only the new task ones. Default is False
         :return: True if the parameter was deleted successfully
         """
         if not Session.check_min_api_version('2.9'):
@@ -1360,7 +1363,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         with self._edit_lock:
             paramkey = tasks.ParamKey(section=name.split('/', 1)[0], name=name.split('/', 1)[1])
             res = self.send(tasks.DeleteHyperParamsRequest(
-                task=self.id, hyperparams=[paramkey]), raise_on_errors=False)
+                task=self.id, hyperparams=[paramkey], force=force), raise_on_errors=False)
             self.reload()
 
         return res.ok()
@@ -1460,52 +1463,6 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
                 execution = self.data.execution
                 execution.docker_cmd = image + (' {}'.format(arguments) if arguments else '')
                 self._edit(execution=execution)
-
-    def set_packages(self, packages):
-        # type: (Union[str, Sequence[str]]) -> ()
-        """
-        Manually specify a list of required packages or a local requirements.txt file.
-
-        :param packages: The list of packages or the path to the requirements.txt file.
-            Example: ["tqdm>=2.1", "scikit-learn"] or "./requirements.txt"
-        """
-        if not packages:
-            return
-        if not isinstance(packages, str) or not os.path.exists(packages):
-            # noinspection PyProtectedMember
-            self._update_requirements(packages)
-            return
-        with open(packages) as f:
-            # noinspection PyProtectedMember
-            self._update_requirements([line.strip() for line in f.readlines()])
-
-    def set_repo(self, repo, branch=None, commit=None):
-        # type: (str, Optional[str], Optional[str]) -> ()
-        """
-        Specify a repository to attach to the function.
-        Allow users to execute the task inside the specified repository, enabling them to load modules/script
-        from the repository. Notice the execution work directory will be the repository root folder.
-        Supports both git repo url link, and local repository path (automatically converted into the remote
-        git/commit as is currently checkout).
-        Example remote url: 'https://github.com/user/repo.git'.
-        Example local repo copy: './repo' -> will automatically store the remote
-        repo url and commit ID based on the locally cloned copy.
-
-        :param repo: Remote URL for the repository to use, OR path to local copy of the git repository
-            Example: 'https://github.com/allegroai/clearml.git' or '~/project/repo'
-        :param branch: Optional, specify the remote repository branch (Ignored, if local repo path is used)
-        :param commit: Optional, specify the repository commit ID (Ignored, if local repo path is used)
-        """
-        if not repo:
-            return
-        with self._edit_lock:
-            self.reload()
-            self.data.script.repository = repo
-            if branch:
-                self.data.script.branch = branch
-            if commit:
-                self.data.script.version_num = commit
-            self._edit(script=self.data.script)
 
     def get_base_docker(self):
         # type: () -> str
@@ -2323,7 +2280,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
             import pkg_resources
         except ImportError:
             get_logger("task").warning(
-                "Requirement file %s skipped since pkg_resources is not installed" % package_name)
+                "Requirement file `{}` skipped since pkg_resources is not installed".format(package_name))
         else:
             with Path(package_name).open() as requirements_txt:
                 for req in pkg_resources.parse_requirements(requirements_txt):

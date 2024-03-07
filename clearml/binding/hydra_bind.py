@@ -1,7 +1,6 @@
 import io
 import sys
 from functools import partial
-import yaml
 from ..config import running_remotely, get_remote_task_id, DEV_TASK_NO_REUSE
 from ..debugging.log import LoggerRoot
 
@@ -15,6 +14,11 @@ class PatchHydra(object):
     _config_section = 'OmegaConf'
     _parameter_section = 'Hydra'
     _parameter_allow_full_edit = '_allow_omegaconf_edit_'
+    _should_delete_overrides = False
+    _overrides_section = "Args/overrides"
+    _default_hydra_context = None
+    _overrides_parser = None
+    _config_group_warning_sent = False
 
     @classmethod
     def patch_hydra(cls):
@@ -42,6 +46,12 @@ class PatchHydra(object):
         except Exception:
             return False
 
+    @classmethod
+    def delete_overrides(cls):
+        if not cls._should_delete_overrides or not cls._current_task:
+            return
+        cls._current_task.delete_parameter(cls._overrides_section, force=True)
+
     @staticmethod
     def update_current_task(task):
         # set current Task before patching
@@ -50,11 +60,24 @@ class PatchHydra(object):
             return
         if PatchHydra.patch_hydra():
             # check if we have an untracked state, store it.
-            if PatchHydra._last_untracked_state.get('connect'):
-                PatchHydra._current_task.connect(**PatchHydra._last_untracked_state['connect'])
-            if PatchHydra._last_untracked_state.get('_set_configuration'):
+            if PatchHydra._last_untracked_state.get("connect"):
+                if PatchHydra._parameter_allow_full_edit in PatchHydra._last_untracked_state["connect"].get("mutable", {}):
+                    allow_omegaconf_edit_section = PatchHydra._parameter_section + "/" + PatchHydra._parameter_allow_full_edit
+                    allow_omegaconf_edit_section_val = PatchHydra._last_untracked_state["connect"]["mutable"].pop(
+                        PatchHydra._parameter_allow_full_edit
+                    )
+                    PatchHydra._current_task.set_parameter(
+                        allow_omegaconf_edit_section,
+                        allow_omegaconf_edit_section_val,
+                        description="If True, the `{}` parameter section will be completely ignored. The OmegaConf will instead be pulled from the `{}` section".format(
+                            PatchHydra._parameter_section,
+                            PatchHydra._config_section
+                        )
+                    )
+                PatchHydra._current_task.connect(**PatchHydra._last_untracked_state["connect"])
+            if PatchHydra._last_untracked_state.get("_set_configuration"):
                 # noinspection PyProtectedMember
-                PatchHydra._current_task._set_configuration(**PatchHydra._last_untracked_state['_set_configuration'])
+                PatchHydra._current_task._set_configuration(**PatchHydra._last_untracked_state["_set_configuration"])
             PatchHydra._last_untracked_state = {}
         else:
             # if patching failed set it to None
@@ -62,41 +85,61 @@ class PatchHydra(object):
 
     @staticmethod
     def _patched_hydra_run(self, config_name, task_function, overrides, *args, **kwargs):
+        PatchHydra._default_hydra_context = self
         PatchHydra._allow_omegaconf_edit = False
+        if not running_remotely():
+            return PatchHydra._original_hydra_run(self, config_name, task_function, overrides, *args, **kwargs)
 
-        # store the config
+        # get the parameters from the backend
         # noinspection PyBroadException
         try:
-            if running_remotely():
-                if not PatchHydra._current_task:
-                    from ..task import Task
-                    PatchHydra._current_task = Task.get_task(task_id=get_remote_task_id())
-                # get the _parameter_allow_full_edit casted back to boolean
-                connected_config = dict()
-                connected_config[PatchHydra._parameter_allow_full_edit] = False
-                PatchHydra._current_task.connect(connected_config, name=PatchHydra._parameter_section)
-                PatchHydra._allow_omegaconf_edit = connected_config.pop(PatchHydra._parameter_allow_full_edit, None)
-                # get all the overrides
-                full_parameters = PatchHydra._current_task.get_parameters(backwards_compatibility=False)
-                stored_config = {k[len(PatchHydra._parameter_section)+1:]: v for k, v in full_parameters.items()
-                                 if k.startswith(PatchHydra._parameter_section+'/')}
-                stored_config.pop(PatchHydra._parameter_allow_full_edit, None)
-                # noinspection PyBroadException
-                try:
-                    overrides = yaml.safe_load(full_parameters.get("Args/overrides", "")) or []
-                except Exception:
-                    overrides = []
-                if overrides and not isinstance(overrides, (list, tuple)):
-                    overrides = [overrides]
-                overrides += ['{}={}'.format(k, v) for k, v in stored_config.items()]
-                overrides = [("+" + o) if (o.startswith("+") and not o.startswith("++")) else o for o in overrides]
-            else:
-                # We take care of it inside the _patched_run_job
-                pass
+            if not PatchHydra._current_task:
+                from ..task import Task
+                PatchHydra._current_task = Task.get_task(task_id=get_remote_task_id())
+            # get the _parameter_allow_full_edit casted back to boolean
+            connected_config = {}
+            connected_config[PatchHydra._parameter_allow_full_edit] = False
+            PatchHydra._current_task.connect(connected_config, name=PatchHydra._parameter_section)
+            PatchHydra._allow_omegaconf_edit = connected_config.pop(PatchHydra._parameter_allow_full_edit, None)
+            # get all the overrides
+            full_parameters = PatchHydra._current_task.get_parameters(backwards_compatibility=False)
+            stored_config = {k[len(PatchHydra._parameter_section)+1:]: v for k, v in full_parameters.items()
+                             if k.startswith(PatchHydra._parameter_section+'/')}
+            stored_config.pop(PatchHydra._parameter_allow_full_edit, None)
+            for override_k, override_v in stored_config.items():
+                new_override = override_k
+                if override_v is not None and override_v != "":
+                    new_override += "=" + override_v
+                if not new_override.startswith("~") and not PatchHydra._is_group(self, new_override):
+                    new_override = "++" + new_override.lstrip("+")
+                overrides.append(new_override)
+            PatchHydra._should_delete_overrides = True
         except Exception:
             pass
 
         return PatchHydra._original_hydra_run(self, config_name, task_function, overrides, *args, **kwargs)
+
+    @staticmethod
+    def _parse_override(override):
+        if PatchHydra._overrides_parser is None:
+            from hydra.core.override_parser.overrides_parser import OverridesParser
+            PatchHydra._overrides_parser = OverridesParser.create()
+        return PatchHydra._overrides_parser.parse_overrides(overrides=[override])[0]
+
+    @staticmethod
+    def _is_group(hydra_context, override):
+        # noinspection PyBroadException
+        try:
+            override = PatchHydra._parse_override(override)
+            group_exists = hydra_context.config_loader.repository.group_exists(override.key_or_group)
+            return group_exists
+        except Exception:
+            if not PatchHydra._config_group_warning_sent:
+                LoggerRoot.get_base_logger().warning(
+                    "Could not determine if Hydra is overriding a Config Group"
+                )
+                PatchHydra._config_group_warning_sent = True
+            return False
 
     @staticmethod
     def _patched_run_job(config, task_function, *args, **kwargs):
@@ -106,20 +149,28 @@ class PatchHydra(object):
 
             failed_status = JobStatus.FAILED
         except Exception:
-            LoggerRoot.get_base_logger(PatchHydra).warning(
+            LoggerRoot.get_base_logger().warning(
                 "Could not import JobStatus from Hydra. Failed tasks will be marked as completed"
             )
             failed_status = None
 
+        hydra_context = kwargs.get("hydra_context", PatchHydra._default_hydra_context)
         # store the config
         # noinspection PyBroadException
         try:
-            if running_remotely():
-                # we take care of it in the hydra run (where we have access to the overrides)
-                pass
-            else:
+            if not running_remotely():
+                # note that we fetch the overrides from the backend in hydra run when running remotely,
+                # here we just get them from hydra to be stored as configuration/parameters
                 overrides = config.hydra.overrides.task
-                stored_config = dict(arg.split('=', 1) for arg in overrides)
+                stored_config = {}
+                for arg in overrides:
+                    if not PatchHydra._is_group(hydra_context, arg):
+                        arg = arg.lstrip("+")
+                    if "=" in arg:
+                        k, v = arg.split("=", 1)
+                        stored_config[k] = v
+                    else:
+                        stored_config[arg] = None
                 stored_config[PatchHydra._parameter_allow_full_edit] = False
                 if PatchHydra._current_task:
                     PatchHydra._current_task.connect(stored_config, name=PatchHydra._parameter_section)
@@ -127,9 +178,7 @@ class PatchHydra(object):
                 else:
                     PatchHydra._last_untracked_state['connect'] = dict(
                         mutable=stored_config, name=PatchHydra._parameter_section)
-                # Maybe ?! remove the overrides section from the Args (we have it here)
-                # But when used with a Pipeline this is the only section we get... so we leave it here anyhow
-                # PatchHydra._current_task.delete_parameter('Args/overrides')
+                PatchHydra._should_delete_overrides = True
         except Exception:
             pass
 
@@ -176,8 +225,7 @@ class PatchHydra(object):
         else:
             # noinspection PyProtectedMember
             omega_yaml = PatchHydra._current_task._get_configuration_text(PatchHydra._config_section)
-            loaded_config = OmegaConf.load(io.StringIO(omega_yaml))
-            a_config = OmegaConf.merge(a_config, loaded_config)
+            a_config = OmegaConf.load(io.StringIO(omega_yaml))
             PatchHydra._register_omegaconf(a_config, is_read_only=False)
         return task_function(a_config, *a_args, **a_kwargs)
 
@@ -193,10 +241,6 @@ class PatchHydra(object):
         else:
             description = 'Full OmegaConf YAML configuration overridden! ({}/{}=True)'.format(
                 PatchHydra._parameter_section, PatchHydra._parameter_allow_full_edit)
-
-        # we should not have the hydra section in the config, but this seems never to be the case anymore.
-        # config = config.copy()
-        # config.pop('hydra', None)
 
         configuration = dict(
             name=PatchHydra._config_section,
