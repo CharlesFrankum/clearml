@@ -52,8 +52,8 @@ class ResourceMonitor(BackgroundMonitor):
             try:
                 active_gpus = os.environ.get('NVIDIA_VISIBLE_DEVICES', '') or \
                     os.environ.get('CUDA_VISIBLE_DEVICES', '')
-                if active_gpus:
-                    self._active_gpus = [int(g.strip()) for g in active_gpus.split(',')]
+                if active_gpus and active_gpus != "all":
+                    self._active_gpus = [g.strip() for g in active_gpus.split(',')]
             except Exception:
                 pass
 
@@ -303,6 +303,17 @@ class ResourceMonitor(BackgroundMonitor):
 
         return mem_size
 
+    def _skip_nonactive_gpu(self, idx, gpu):
+        if not self._active_gpus:
+            return False
+        # noinspection PyBroadException
+        try:
+            uuid = getattr(gpu, "uuid", None)
+            return str(idx) not in self._active_gpus and (not uuid or uuid not in self._active_gpus)
+        except Exception:
+            pass
+        return False
+
     def _get_gpu_stats(self):
         if not self._gpustat:
             return {}
@@ -327,7 +338,7 @@ class ResourceMonitor(BackgroundMonitor):
                     self._gpu_memory_per_process = False
                     break
                 # only monitor the active gpu's, if none were selected, monitor everything
-                if self._active_gpus and i not in self._active_gpus:
+                if self._skip_nonactive_gpu(i, g):
                     continue
 
                 gpu_mem[i] = 0
@@ -347,7 +358,7 @@ class ResourceMonitor(BackgroundMonitor):
 
         for i, g in enumerate(gpu_stat.gpus):
             # only monitor the active gpu's, if none were selected, monitor everything
-            if self._active_gpus and i not in self._active_gpus:
+            if self._skip_nonactive_gpu(i, g):
                 continue
             stats["gpu_%d_temperature" % i] = float(g["temperature.gpu"])
             stats["gpu_%d_utilization" % i] = float(g["utilization.gpu"])
@@ -378,7 +389,7 @@ class ResourceMonitor(BackgroundMonitor):
             if self._gpustat:
                 gpu_stat = self._gpustat.new_query(shutdown=True, get_driver_info=True)
                 if gpu_stat.gpus:
-                    gpus = [g for i, g in enumerate(gpu_stat.gpus) if not self._active_gpus or i in self._active_gpus]
+                    gpus = [g for i, g in enumerate(gpu_stat.gpus) if not self._skip_nonactive_gpu(i, g)]
                     specs.update(
                         gpu_count=int(len(gpus)),
                         gpu_type=', '.join(g.name for g in gpus),

@@ -17,16 +17,14 @@ from ...task import Task
 
 
 class CreateAndPopulate(object):
-    _VCS_SSH_REGEX = \
-        "^" \
-        "(?:(?P<user>{regular}*?)@)?" \
-        "(?P<host>{regular}*?)" \
-        ":" \
-        "(?P<path>{regular}.*)?" \
-        "$" \
-        .format(
-            regular=r"[^/@:#]"
-        )
+    _VCS_SSH_REGEX = (
+        "^"
+        "(?:(?P<user>{regular}*?)@)?"
+        "(?P<host>{regular}*?)"
+        ":"
+        "(?P<path>{regular}.*)?"
+        "$".format(regular=r"[^/@:#]")
+    )
 
     def __init__(
             self,
@@ -94,7 +92,6 @@ class CreateAndPopulate(object):
             repo = None
         else:
             folder = None
-
         if raise_on_missing_entries and not base_task_id:
             if not script:
                 raise ValueError("Entry point script not provided")
@@ -170,7 +167,6 @@ class CreateAndPopulate(object):
                 and not self.repo and (
                 not repo_info or not repo_info.script or not repo_info.script.get('repository')):
             raise ValueError("Standalone script detected \'{}\', but no requirements provided".format(self.script))
-
         if dry_run:
             task = None
             task_state = dict(
@@ -178,7 +174,7 @@ class CreateAndPopulate(object):
                 project=Task.get_project_id(self.project_name),
                 type=str(self.task_type or Task.TaskTypes.training),
             )  # type: dict
-            if self.output_uri:
+            if self.output_uri is not None:
                 task_state['output'] = dict(destination=self.output_uri)
         else:
             task_state = dict(script={})
@@ -199,14 +195,13 @@ class CreateAndPopulate(object):
 
                 # if there is nothing to populate, return
                 if not any([
-                    self.folder, self.commit, self.branch, self.repo, self.script, self.cwd,
-                    self.packages, self.requirements_file, self.base_task_id] + (list(self.docker.values()))
-                ):
+                               self.folder, self.commit, self.branch, self.repo, self.script, self.cwd,
+                               self.packages, self.requirements_file, self.base_task_id] + (list(self.docker.values()))
+                           ):
                     return task
 
         # clear the script section
         task_state['script'] = {}
-
         if repo_info:
             task_state['script']['repository'] = repo_info.script['repository']
             task_state['script']['version_num'] = repo_info.script['version_num']
@@ -218,15 +213,19 @@ class CreateAndPopulate(object):
             task_state['script']['requirements'] = repo_info.script.get('requirements') or {}
             if self.cwd:
                 self.cwd = self.cwd
-                cwd = self.cwd if Path(self.cwd).is_dir() else (
-                            Path(repo_info.script['repo_root']) / self.cwd).as_posix()
+                # cwd should be relative to the repo_root, but we need the full path
+                # (repo_root + cwd) in order to resolve the entry point
+                cwd = (Path(repo_info.script['repo_root']) / self.cwd).as_posix()
+
                 if not Path(cwd).is_dir():
                     raise ValueError("Working directory \'{}\' could not be found".format(cwd))
-                cwd = Path(cwd).relative_to(repo_info.script['repo_root']).as_posix()
                 entry_point = \
                     Path(repo_info.script['repo_root']) / repo_info.script['working_dir'] / repo_info.script[
                         'entry_point']
+                # resolve entry_point relative to the current working directory
                 entry_point = entry_point.relative_to(cwd).as_posix()
+                # restore cwd - make it relative to the repo_root again
+                cwd = Path(cwd).relative_to(repo_info.script['repo_root']).as_posix()
                 task_state['script']['entry_point'] = entry_point or ""
                 task_state['script']['working_dir'] = cwd or "."
         elif self.repo:
@@ -262,7 +261,6 @@ class CreateAndPopulate(object):
             # standalone task
             task_state['script']['entry_point'] = self.script or ""
             task_state['script']['working_dir'] = '.'
-
         # update requirements
         reqs = []
         if self.requirements_file:
@@ -347,7 +345,6 @@ class CreateAndPopulate(object):
             if task_state['script']['diff'] and not task_state['script']['diff'].endswith('\n'):
                 task_state['script']['diff'] += '\n'
             task_state['script']['diff'] += task_init_patch
-
         # set base docker image if provided
         if self.docker:
             if dry_run:
@@ -391,7 +388,7 @@ class CreateAndPopulate(object):
         return task
 
     def _set_output_uri(self, task):
-        if self.output_uri:
+        if self.output_uri is not None:
             try:
                 task.output_uri = self.output_uri
             except ValueError:
@@ -577,6 +574,7 @@ if __name__ == '__main__':
             artifact_deserialization_function=None,  # type: Optional[Callable[[bytes], Any]]
             _sanitize_function=None,  # type: Optional[Callable[[str], str]]
             _sanitize_helper_functions=None,  # type: Optional[Callable[[str], str]]
+            skip_global_imports=False  # type: bool
     ):
         # type: (...) -> Optional[Dict, Task]
         """
@@ -659,6 +657,9 @@ if __name__ == '__main__':
                     return dill.loads(bytes_)
         :param _sanitize_function: Sanitization function for the function string.
         :param _sanitize_helper_functions: Sanitization function for the helper function string.
+        :param skip_global_imports: If True, the global imports will not be fetched from the function's file, otherwise
+            all global imports will be automatically imported in a safe manner at the beginning of the function's
+            execution. Default is False
         :return: Newly created Task object
         """
         # not set -> equals True
@@ -671,7 +672,7 @@ if __name__ == '__main__':
         assert (not auto_connect_arg_parser or isinstance(auto_connect_arg_parser, (bool, dict)))
 
         function_source, function_name = CreateFromFunction.__extract_function_information(
-            a_function, sanitize_function=_sanitize_function
+            a_function, sanitize_function=_sanitize_function, skip_global_imports=skip_global_imports
         )
         # add helper functions on top.
         for f in (helper_functions or []):
@@ -846,11 +847,133 @@ if __name__ == '__main__':
             return function_source
 
     @staticmethod
-    def __extract_function_information(function, sanitize_function=None):
-        # type: (Callable, Optional[Callable]) -> (str, str)
-        function_name = str(function.__name__)
-        function_source = inspect.getsource(function)
+    def __extract_imports(func):
+        def add_import_guard(import_):
+            return ("try:\n    "
+                    + import_.replace("\n", "\n    ", import_.count("\n") - 1)
+                    + "\nexcept Exception as e:\n    print('Import error: ' + str(e))\n"
+                    )
+
+        # noinspection PyBroadException
+        try:
+            import ast
+            func_module = inspect.getmodule(func)
+            source = inspect.getsource(func_module)
+            parsed_source = ast.parse(source)
+            imports = []
+            for parsed_source_entry in parsed_source.body:
+                # we only include global imports (i.e. at col_offset 0)
+                if parsed_source_entry.col_offset != 0:
+                    continue
+                if isinstance(parsed_source_entry, ast.ImportFrom):
+                    for sub_entry in parsed_source_entry.names:
+                        import_str = "from {} import {}".format(parsed_source_entry.module, sub_entry.name)
+                        if sub_entry.asname:
+                            import_str += " as {}".format(sub_entry.asname)
+                        imports.append(import_str)
+                elif isinstance(parsed_source_entry, ast.Import):
+                    for sub_entry in parsed_source_entry.names:
+                        import_str = "import {}".format(sub_entry.name)
+                        if sub_entry.asname:
+                            import_str += " as {}".format(sub_entry.asname)
+                        imports.append(import_str)
+            imports = [add_import_guard(import_) for import_ in imports]
+            return "\n".join(imports)
+        except Exception as e:
+            getLogger().warning('Could not fetch function imports: {}'.format(e))
+            return ""
+
+    @staticmethod
+    def _extract_wrapped(decorated):
+        if not decorated.__closure__:
+            return None
+        closure = (c.cell_contents for c in decorated.__closure__)
+        if not closure:
+            return None
+        return next((c for c in closure if inspect.isfunction(c)), None)
+
+    @staticmethod
+    def _deep_extract_wrapped(decorated):
+        while True:
+            # noinspection PyProtectedMember
+            func = CreateFromFunction._extract_wrapped(decorated)
+            if not func:
+                return decorated
+            decorated = func
+
+    @staticmethod
+    def __sanitize(func_source, sanitize_function=None):
         if sanitize_function:
-            function_source = sanitize_function(function_source)
-        function_source = CreateFromFunction.__sanitize_remove_type_hints(function_source)
-        return function_source, function_name
+            func_source = sanitize_function(func_source)
+        return CreateFromFunction.__sanitize_remove_type_hints(func_source)
+
+    @staticmethod
+    def __get_func_members(module):
+        result = []
+        try:
+            import ast
+
+            source = inspect.getsource(module)
+            parsed = ast.parse(source)
+            for f in parsed.body:
+                if isinstance(f, ast.FunctionDef):
+                    result.append(f.name)
+        except Exception as e:
+            name = getattr(module, "__name__", module)
+            getLogger().warning('Could not fetch function declared in {}: {}'.format(name, e))
+        return result
+
+    @staticmethod
+    def __get_source_with_decorators(func, original_module=None, sanitize_function=None):
+        if original_module is None:
+            original_module = inspect.getmodule(func)
+        func_members = CreateFromFunction.__get_func_members(original_module)
+        try:
+            func_members_dict = dict(inspect.getmembers(original_module, inspect.isfunction))
+        except Exception as e:
+            name = getattr(original_module, "__name__", original_module)
+            getLogger().warning('Could not fetch functions from {}: {}'.format(name, e))
+            func_members_dict = {}
+        decorated_func = CreateFromFunction._deep_extract_wrapped(func)
+        decorated_func_source = CreateFromFunction.__sanitize(
+            inspect.getsource(decorated_func),
+            sanitize_function=sanitize_function
+        )
+        try:
+            import ast
+
+            parsed_decorated = ast.parse(decorated_func_source)
+            for body_elem in parsed_decorated.body:
+                if not isinstance(body_elem, ast.FunctionDef):
+                    continue
+                for decorator in body_elem.decorator_list:
+                    name = None
+                    if isinstance(decorator, ast.Name):
+                        name = decorator.id
+                    elif isinstance(decorator, ast.Call):
+                        name = decorator.func.id
+                    if not name:
+                        continue
+                    decorator_func = func_members_dict.get(name)
+                    if name not in func_members or not decorator_func:
+                        continue
+                    decorated_func_source = CreateFromFunction.__get_source_with_decorators(
+                        decorator_func,
+                        original_module=original_module,
+                        sanitize_function=sanitize_function
+                    ) + "\n\n" + decorated_func_source
+                break
+        except Exception as e:
+            getLogger().warning('Could not fetch full definition of function {}: {}'.format(func.__name__, e))
+        return decorated_func_source
+
+    @staticmethod
+    def __extract_function_information(function, sanitize_function=None, skip_global_imports=False):
+        # type: (Callable, Optional[Callable], bool) -> (str, str)
+        function = CreateFromFunction._deep_extract_wrapped(function)
+        function_source = CreateFromFunction.__get_source_with_decorators(function, sanitize_function=sanitize_function)
+        if not skip_global_imports:
+            imports = CreateFromFunction.__extract_imports(function)
+        else:
+            imports = ""
+        return imports + "\n" + function_source, function.__name__

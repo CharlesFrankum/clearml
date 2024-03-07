@@ -78,13 +78,15 @@ class InterfaceBase(SessionInterface):
             except MaxRequestSizeError as e:
                 res = CallResult(meta=ResponseMeta.from_raw_data(status_code=400, text=str(e)))
                 error_msg = 'Failed sending: %s' % str(e)
-            except requests.exceptions.ConnectionError:
+            except requests.exceptions.ConnectionError as e:
                 # We couldn't send the request for more than the retries times configure in the api configuration file,
                 # so we will end the loop and raise the exception to the upper level.
                 # Notice: this is a connectivity error and not a backend error.
-                if raise_on_errors:
-                    raise
+                # if raise_on_errors:
+                #     raise
                 res = None
+                if log and num_retries >= cls._num_retry_warning_display:
+                    log.warning('Retrying, previous request failed %s: %s' % (str(type(req)), str(e)))
             except cls._JSON_EXCEPTION as e:
                 if log:
                     log.error(
@@ -176,8 +178,9 @@ class IdObjectBase(InterfaceBase):
         # noinspection PyBroadException
         try:
             self._data = self._reload()
-        except Exception:
-            self.log.error("Failed reloading task {}".format(self.id))
+        except Exception as ex:
+            self.log.error("Failed reloading {} {}".format(type(self).__name__.lower(), self.id))
+            self.log.debug("Failed reloading {} {}: {}".format(type(self).__name__.lower(), self.id, ex))
 
     @classmethod
     def normalize_id(cls, id):

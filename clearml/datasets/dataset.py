@@ -29,6 +29,7 @@ from ..storage.util import sha256sum, is_windows, md5text, format_size
 from ..utilities.matching import matches_any_wildcard
 from ..utilities.parallel import ParallelZipper
 from ..utilities.version import Version
+from ..utilities.files import is_path_traversal
 
 try:
     from pathlib import Path as _Path  # noqa
@@ -1241,7 +1242,7 @@ class Dataset(object):
 
         :return: Newly created Dataset object
         """
-        if not Dataset.is_offline() and not Session.check_min_api_server_version("2.13"):
+        if not Dataset.is_offline() and not Session.check_min_api_server_version("2.13", raise_error=True):
             raise NotImplementedError("Datasets are not supported with your current ClearML server version. Please update your server.")
 
         parent_datasets = [cls.get(dataset_id=p) if not isinstance(p, Dataset) else p for p in (parent_datasets or [])]
@@ -1531,7 +1532,7 @@ class Dataset(object):
         """
         if Dataset.is_offline():
             raise ValueError("Cannot rename dataset in offline mode")
-        if not bool(Session.check_min_api_server_version(cls.__min_api_version)):
+        if not bool(Session.check_min_api_server_version(cls.__min_api_version, raise_error=True)):
             LoggerRoot.get_base_logger().warning(
                 "Could not rename dataset because API version < {}".format(cls.__min_api_version)
             )
@@ -1578,7 +1579,7 @@ class Dataset(object):
         """
         if cls.is_offline():
             raise ValueError("Cannot move dataset project in offlime mode")
-        if not bool(Session.check_min_api_server_version(cls.__min_api_version)):
+        if not bool(Session.check_min_api_server_version(cls.__min_api_version, raise_error=True)):
             LoggerRoot.get_base_logger().warning(
                 "Could not move dataset to another project because API version < {}".format(cls.__min_api_version)
             )
@@ -1856,6 +1857,12 @@ class Dataset(object):
             for ds in datasets:
                 base_folder = Path(ds._get_dataset_files())
                 files = [f.relative_path for f in ds.file_entries if f.parent_dataset_id == ds.id]
+                files = [
+                    os.path.basename(file)
+                    if is_path_traversal(base_folder, file) or is_path_traversal(temp_folder, file)
+                    else file
+                    for file in files
+                ]
                 pool.map(
                     lambda x:
                         (temp_folder / x).parent.mkdir(parents=True, exist_ok=True) or
@@ -2361,12 +2368,24 @@ class Dataset(object):
                 link.size = Path(target_path).stat().st_size
         if not max_workers:
             for relative_path, link in links.items():
-                target_path = os.path.join(target_folder, relative_path)
+                if not is_path_traversal(target_folder, relative_path):
+                    target_path = os.path.join(target_folder, relative_path)
+                else:
+                    LoggerRoot.get_base_logger().warning(
+                        "Ignoring relative path `{}`: it must not traverse directories".format(relative_path)
+                    )
+                    target_path = os.path.join(target_folder, os.path.basename(relative_path))
                 _download_link(link, target_path)
         else:
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 for relative_path, link in links.items():
-                    target_path = os.path.join(target_folder, relative_path)
+                    if not is_path_traversal(target_folder, relative_path):
+                        target_path = os.path.join(target_folder, relative_path)
+                    else:
+                        LoggerRoot.get_base_logger().warning(
+                            "Ignoring relative path `{}`: it must not traverse directories".format(relative_path)
+                        )
+                        target_path = os.path.join(target_folder, os.path.basename(relative_path))
                     pool.submit(_download_link, link, target_path)
 
     def _extract_dataset_archive(
@@ -2532,7 +2551,7 @@ class Dataset(object):
 
         # check if target folder is not empty, see if it contains everything we need
         if target_base_folder and next(target_base_folder.iterdir(), None):
-            if self._verify_dataset_folder(target_base_folder, part, chunk_selection):
+            if self._verify_dataset_folder(target_base_folder, part, chunk_selection, max_workers):
                 target_base_folder.touch()
                 self._release_lock_ds_target_folder(target_base_folder)
                 return target_base_folder.as_posix()
@@ -2573,7 +2592,7 @@ class Dataset(object):
             raise_on_error=False, force=False)
 
         # verify entire dataset (if failed, force downloading parent datasets)
-        if not self._verify_dataset_folder(target_base_folder, part, chunk_selection):
+        if not self._verify_dataset_folder(target_base_folder, part, chunk_selection, max_workers):
             LoggerRoot.get_base_logger().info('Dataset parents need refreshing, re-fetching all parent datasets')
             # we should delete the entire cache folder
             self._extract_parent_datasets(
@@ -3249,31 +3268,43 @@ class Dataset(object):
                 raise ValueError("Dataset merging failed: {}".format([e for e in errors if e is not None]))
         pool.close()
 
-    def _verify_dataset_folder(self, target_base_folder, part, chunk_selection):
-        # type: (Path, Optional[int], Optional[dict]) -> bool
+    def _verify_dataset_folder(self, target_base_folder, part, chunk_selection, max_workers):
+        # type: (Path, int, dict, int) -> bool
+
+        def __verify_file_or_link(target_base_folder, file_entry, part=None, chunk_selection=None):
+            # type: (Path, Union[FileEntry, LinkEntry], Optional[int], Optional[dict]) -> bool
+
+            # check if we need the file for the requested dataset part
+            if part is not None:
+                f_parts = chunk_selection.get(file_entry.parent_dataset_id, [])
+                # file is not in requested dataset part, no need to check it.
+                if self._get_chunk_idx_from_artifact_name(file_entry.artifact_name) not in f_parts:
+                    return True
+
+            # check if the local size and the stored size match (faster than comparing hash)
+            if (target_base_folder / file_entry.relative_path).stat().st_size != file_entry.size:
+                return False
+
+            return True
+
         target_base_folder = Path(target_base_folder)
         # check dataset file size, if we have a full match no need for parent dataset download / merge
         verified = True
         # noinspection PyBroadException
+        tp = None
         try:
-            for f in self._dataset_file_entries.values():
-                # check if we need it for the current part
-                if part is not None:
-                    f_parts = chunk_selection.get(f.parent_dataset_id, [])
-                    # this is not in our current part, no need to check it.
-                    if self._get_chunk_idx_from_artifact_name(f.artifact_name) not in f_parts:
-                        continue
+            futures_ = []
+            with ThreadPoolExecutor(max_workers=max_workers) as tp:
+                for f in self._dataset_file_entries.values():
+                    future = tp.submit(__verify_file_or_link, target_base_folder, f, part, chunk_selection)
+                    futures_.append(future)
 
-                # check if the local size and the stored size match (faster than comparing hash)
-                if (target_base_folder / f.relative_path).stat().st_size != f.size:
-                    verified = False
-                    break
+                for f in self._dataset_link_entries.values():
+                    # don't check whether link is in dataset part, hence None for part and chunk_selection
+                    future = tp.submit(__verify_file_or_link, target_base_folder, f, None, None)
+                    futures_.append(future)
 
-            for f in self._dataset_link_entries.values():
-                if (target_base_folder / f.relative_path).stat().st_size != f.size:
-                    verified = False
-                    break
-
+                verified = all(f.result() for f in futures_)
         except Exception:
             verified = False
 
