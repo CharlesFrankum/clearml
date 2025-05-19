@@ -180,8 +180,9 @@ class CreateAndPopulate(object):
 
                 try:
                     if entry_point and Path(entry_point).is_file() and self.folder and Path(self.folder).is_dir():
-                        # make sure we raise exception if this is outside the local repo folder
-                        entry_point = (Path(entry_point) / (Path(entry_point).relative_to(self.folder))).as_posix()
+                        if Path(self.folder) not in Path(entry_point).parents:
+                            # make sure we raise exception if this is outside the local repo folder
+                            entry_point = (Path(entry_point) / (Path(entry_point).relative_to(self.folder))).as_posix()
                 except ValueError:
                     entry_point = self.folder
                     stand_alone_script_outside_repo = True
@@ -989,11 +990,12 @@ if __name__ == '__main__':
                 requirements_file = packages
                 packages = False
 
+            script = Path(temp_file.name).name
             populate = CreateAndPopulate(
                 project_name=project_name,
                 task_name=task_name or str(function_name),
                 task_type=task_type,
-                script=temp_file.name,
+                script=script,
                 packages=packages if packages is not None else True,
                 requirements_file=requirements_file,
                 repo=repo,
@@ -1007,11 +1009,31 @@ if __name__ == '__main__':
                 working_directory=working_dir,
             )
             entry_point = "{}.py".format(function_name)
+            script_info = {"entry_point": entry_point, "working_dir": "."}
             task = populate.create_task(dry_run=dry_run)
 
+            # Patch the task template to the tracked diff
+            task_template_diff_lines = [
+                "+{line}".format(line=line) for line in task_template.split("\n")
+            ]
+            task_template_diff = "\n".join(task_template_diff_lines)
+            task_template_patch = (
+                "diff --git a/{script_entry} b/{script_entry}\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/{script_entry}\n"
+                "@@ -0,0 +1,{idx} @@\n"
+                "{diff}\n"
+            ).format(
+                script_entry=entry_point,
+                idx=len(task_template_diff_lines),
+                diff=task_template_diff,
+            )
+            task["script"]["diff"] += task_template_patch
+
             if dry_run:
-                task["script"]["diff"] = task_template
-                task["script"]["entry_point"] = entry_point
+                task["script"].update(script_info)
+                task["script"]["diff"] = task["script"]["diff"].replace(script, entry_point)
                 task["script"]["working_dir"] = working_dir or "."
                 task["hyperparams"] = {
                     cls.kwargs_section: {
@@ -1033,17 +1055,9 @@ if __name__ == '__main__':
                     },
                 }
             else:
-                task.update_task(
-                    task_data={
-                        "script": task.data.script.to_dict().update(
-                            {
-                                "entry_point": entry_point,
-                                "working_dir": ".",
-                                "diff": task_template,
-                            }
-                        )
-                    }
-                )
+                script_data = task.data.script.to_dict().update(script_info)
+                script_data["diff"] = script_data["diff"].replace(script, entry_point)
+                task.update_task(task_data={"script": script_data})
                 hyper_parameters = (
                     {"{}/{}".format(cls.kwargs_section, k): str(v) for k, v in function_kwargs}
                     if function_kwargs

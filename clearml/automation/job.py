@@ -702,8 +702,26 @@ class LocalClearmlJob(ClearmlJob):
         if self._is_cached_task:
             return False
 
-        # check if standalone
         diff = self.task.data.script.diff
+
+        # Extract the script code from the diff
+        if diff and diff.lstrip().startswith('diff '):
+            # If new file diff for entry_point is present in the diff then extract the code from here
+            split_diff = diff.split("\n")
+            new_file_diff_string = "+++ b/{}".format(self.task.data.script.entry_point)
+            if new_file_diff_string in split_diff:
+                # The code section for the new file will be +1 line after this string
+                start_ix = split_diff.index(new_file_diff_string) + 2
+                split_diff = split_diff[start_ix:]
+                # If "diff --git" is still present in this section then trim the list from the end
+                end_ix = next((i for i, x in enumerate(split_diff) if x.startswith("diff --git")), None)
+                if end_ix:
+                    split_diff = split_diff[:end_ix]
+                # Remove leading "+" from each line
+                split_diff = [x[1:] for x in split_diff]
+                diff = "\n".join(split_diff)
+
+        # check if standalone
         if diff and not diff.lstrip().startswith("diff "):
             # standalone, we need to create if
             fd, local_filename = tempfile.mkstemp(suffix=".py")
